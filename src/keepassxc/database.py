@@ -58,14 +58,18 @@ class EstablishConnectionError(ConnectionError, KeePassXCError):
 
 
 class Connection(AsyncContextManager):
+    _private_init = object()
 
-    def __init__(self):
+    def __init__(self, /, _private_init):
+        if _private_init is not Connection._private_init:
+            raise TypeError("__init__ is private")
+
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
 
     @classmethod
     async def create(cls, socket_dirs: Iterable[Path] = None, socket_name: str = _KPXC_SOCKET_NAME):
-        self = cls()
+        self = cls(_private_init=Connection._private_init)
 
         exceptions = []
         non_empty = False
@@ -144,7 +148,12 @@ class MessageAction(Enum):
 
 
 class BaseClient(AsyncContextManager):
-    def __init__(self):
+    _private_init = object()
+
+    def __init__(self, /, _private_init):
+        if _private_init is not BaseClient._private_init:
+            raise TypeError("__init__ is private")
+
         self._replies: dict[MessageAction, asyncio.Queue[asyncio.Future]] = {
             action: asyncio.Queue(1)
             for action in MessageAction if not action.is_signal()
@@ -156,7 +165,7 @@ class BaseClient(AsyncContextManager):
 
     @classmethod
     async def create(cls, connection: Callable[[], Awaitable[Connection]] = Connection.create):
-        self = cls()
+        self = cls(_private_init=BaseClient._private_init)
 
         self._connection = await connection()
         self._worker_task = asyncio.create_task(self._worker())
@@ -424,7 +433,12 @@ class RequestAutotypeResponse:
 
 
 class Client(AsyncContextManager):
-    def __init__(self):
+    _private_init = object()
+
+    def __init__(self, /, _private_init):
+        if _private_init is not Client._private_init:
+            raise TypeError("__init__ is private")
+
         self._session_client_key = nacl.public.PrivateKey.generate()
         self._session_client_id = SessionClientID.generate()
 
@@ -438,7 +452,7 @@ class Client(AsyncContextManager):
 
     @classmethod
     async def create(cls, base_client: Callable[[], Awaitable[BaseClient]] = BaseClient.create):
-        self = cls()
+        self = cls(_private_init=Client._private_init)
 
         self._base_client = await base_client()
         self._session_server_public_key = await self._exchange_public_keys()
