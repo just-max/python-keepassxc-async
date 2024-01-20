@@ -20,7 +20,7 @@ except ImportError:
         print(Group.dump_tree(g))
 
 
-async def connect_to_keepassxc(min_delay=1, max_delay=60.):
+async def connect_to_keepassxc(min_delay=1., max_delay=60.):
     """Tries to connect to KeePassXC until a connection is established"""
 
     delay = min_delay
@@ -37,8 +37,7 @@ async def example():
     # logging.basicConfig(level=logging.DEBUG)  # enable to see raw messages passed to/from KeePassXC
 
     async with await connect_to_keepassxc() as client:
-        client: Client
-        # TODO: why is this not typed automatically???? -> solution: add aenter to Client with explicit return type :(
+        client: Client  # some IDEs don't type __aenter__ properly
 
         print("connected to KeePassXC")
 
