@@ -2,22 +2,24 @@ import asyncio
 import base64
 import enum
 import json
+import logging
 import os
 import tempfile
-import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Optional, Callable, AsyncContextManager, Awaitable, Any
+from typing import Iterable, Optional, Callable, AsyncContextManager, Awaitable, Any, TypeVar
 
 import nacl.public
 import nacl.utils
 
-_KPXC_SOCKET_NAME = "org.keepassxc.KeePassXC.BrowserServer"
-
+from ._async_util import EventEmitter
 
 _logger = logging.getLogger(__name__)
+
+
+_KPXC_SOCKET_NAME = "org.keepassxc.KeePassXC.BrowserServer"
 
 
 def _kpxc_socket_dirs() -> Iterable[Path]:
@@ -47,14 +49,15 @@ def _kpxc_stringify_bool(value: bool):
     return "true" if value else "false"
 
 
+def _magic(value: Any) -> Any:
+    return value
+
+
 class KeePassXCError(Exception):
     pass
 
 
 # === socket connection ===
-
-class EstablishConnectionError(ConnectionError, KeePassXCError):
-    pass
 
 
 class Connection(AsyncContextManager):
@@ -64,11 +67,11 @@ class Connection(AsyncContextManager):
         if _private_init is not Connection._private_init:
             raise TypeError("__init__ is private")
 
-        self._reader: Optional[asyncio.StreamReader] = None
-        self._writer: Optional[asyncio.StreamWriter] = None
+        self._reader: asyncio.StreamReader = _magic(None)
+        self._writer: asyncio.StreamWriter = _magic(None)
 
     @classmethod
-    async def create(cls, socket_dirs: Iterable[Path] = None, socket_name: str = _KPXC_SOCKET_NAME):
+    async def create(cls, socket_dirs: Optional[Iterable[Path]] = None, socket_name: str = _KPXC_SOCKET_NAME):
         self = cls(_private_init=Connection._private_init)
 
         exceptions = []
@@ -86,7 +89,7 @@ class Connection(AsyncContextManager):
         if not non_empty:
             raise ValueError("socket_dirs must be a non-empty sequence")
         elif exceptions:
-            raise EstablishConnectionError("could not connect") from ExceptionGroup("multiple exceptions", exceptions)
+            raise ExceptionGroup("could not connect", exceptions)
 
         return self
 
@@ -147,6 +150,10 @@ class MessageAction(Enum):
         return action, message_
 
 
+class KeePassXCExited(KeePassXCError):
+    pass
+
+
 class BaseClient(AsyncContextManager):
     _private_init = object()
 
@@ -154,14 +161,17 @@ class BaseClient(AsyncContextManager):
         if _private_init is not BaseClient._private_init:
             raise TypeError("__init__ is private")
 
-        self._replies: dict[MessageAction, asyncio.Queue[asyncio.Future]] = {
+        self._replies: dict[MessageAction, asyncio.Queue[asyncio.Future[Any]]] = {
             action: asyncio.Queue(1)
             for action in MessageAction if not action.is_signal()
         }
+        self._pending: set[asyncio.Future] = set()
 
-        self._signal_queue: asyncio.Queue[tuple[MessageAction, Any]] = asyncio.Queue()
-        self._connection: Optional[Connection] = None
-        self._worker_task: Optional[asyncio.Task] = None
+        self._event_emitter: EventEmitter[MessageAction, Any] = EventEmitter()
+        self._connection: Connection = _magic(None)
+        self._worker_task: asyncio.Task = _magic(None)
+
+        self._eof = False
 
     @classmethod
     async def create(cls, connection: Callable[[], Awaitable[Connection]] = Connection.create):
@@ -175,26 +185,43 @@ class BaseClient(AsyncContextManager):
     async def _worker(self):
         while True:
             # TODO: error handling
-            action, data = MessageAction.of_message(json.loads(await self._connection.read()))
 
-            if not action.is_signal():
-                try:
-                    fut = self._replies[action].get_nowait()
-                except asyncio.QueueEmpty:
+            message = await self._connection.read()
+            if not message:
+                self._do_eof()
+                return
+
+            action, data = MessageAction.of_message(json.loads(message))
+            if action.is_signal():
+                self._event_emitter.emit(action, data)
+            else:
+                q = self._replies[action]
+                if q.qsize() == 0:
                     _logger.warning("unsolicited message ignored: %s %s", action, data)
                     continue
-                fut.set_result(data)
-            else:
-                self._signal_queue.put_nowait((action, data))
+                q.get_nowait().set_result(data)
+
+    def _do_eof(self):
+        self._eof = True
+        for p in self._pending:
+            p.set_exception(KeePassXCExited("eof"))
+        self._event_emitter.close()
 
     async def _do_request(self, action: MessageAction, msg: bytes):
+        if self._eof:
+            raise KeePassXCExited()
+
         fut = asyncio.get_running_loop().create_future()
-        await self._replies[action].put(fut)  # maxsize=1 on queue ensures blocking until pending request completes
+        self._pending.add(fut)
 
-        self._connection.send(msg)
-        await self._connection.drain()  # TODO: is drain necessary?
-
-        return await fut
+        try:
+            await self._replies[action].put(fut)  # maxsize=1 on queue ensures blocking until pending request completes
+            if not self._eof:
+                self._connection.send(msg)
+                await self._connection.drain()  # TODO: is drain necessary?
+            return await fut
+        finally:
+            self._pending.remove(fut)
 
     async def request(self, action: MessageAction, /, **data):
         if action.is_signal():
@@ -202,11 +229,15 @@ class BaseClient(AsyncContextManager):
         msg = json.dumps(action.make_message(**data)).encode()
         return await self._do_request(action, msg)
 
-    async def wait_signal(self):
-        return await self._signal_queue.get()
+    def listen(self, *actions: MessageAction):
+        for action in actions:
+            if not action.is_signal():
+                raise ValueError(f"action {action.value} is not a signal")
+        return self._event_emitter.listen(*actions)
 
     def close(self):
         self._worker_task.cancel()
+        self._event_emitter.close()
         self._connection.close()
 
     async def wait_closed(self):
@@ -432,6 +463,9 @@ class RequestAutotypeResponse:
     pass
 
 
+T = TypeVar("T")
+
+
 class Client(AsyncContextManager):
     _private_init = object()
 
@@ -442,13 +476,13 @@ class Client(AsyncContextManager):
         self._session_client_key = nacl.public.PrivateKey.generate()
         self._session_client_id = SessionClientID.generate()
 
-        self._base_client: Optional[BaseClient] = None
-        self._session_server_public_key: Optional[nacl.public.PublicKey] = None
-        self._box: Optional[nacl.public.Box] = None
+        self._base_client: BaseClient = _magic(None)
+        self._session_server_public_key: nacl.public.PublicKey = _magic(None)
+        self._box: nacl.public.Box = _magic(None)
 
         self._unlocked = asyncio.Event()
         self._locked = asyncio.Event()
-        self._lock_listener_task: Optional[asyncio.Task] = None
+        self._lock_listener_task: asyncio.Task = _magic(None)
 
     @classmethod
     async def create(cls, base_client: Callable[[], Awaitable[BaseClient]] = BaseClient.create):
@@ -459,6 +493,9 @@ class Client(AsyncContextManager):
 
         self._box = nacl.public.Box(self._session_client_key, self._session_server_public_key)
 
+        # note that locked and unlocked signals don't necessarily alternate,
+        # e.g. when switching between two open databases in KPXC, only 'unlocked' events are fired;
+        # thus, we have a separate asyncio.Event for each
         if await self.is_unlocked():
             self._unlocked.set()
         else:
@@ -468,15 +505,18 @@ class Client(AsyncContextManager):
         return self
 
     async def _lock_listener(self):
-        while True:
-            e, _ = await self._base_client.wait_signal()
-            match e:
-                case MessageAction.DATABASE_LOCKED:
-                    self._locked.set()
-                    self._unlocked.clear()
-                case MessageAction.DATABASE_UNLOCKED:
-                    self._unlocked.set()
-                    self._locked.clear()
+        async with self.listen(MessageAction.DATABASE_LOCKED, MessageAction.DATABASE_UNLOCKED) as listener:
+            async for event, _ in listener:
+                match event:
+                    case MessageAction.DATABASE_LOCKED:
+                        self._unlocked.clear()
+                        self._locked.set()
+                    case MessageAction.DATABASE_UNLOCKED:
+                        self._locked.clear()
+                        self._unlocked.set()
+
+    def listen(self, *actions):
+        return self._base_client.listen(*actions)
 
     async def is_unlocked(self):
         try:
@@ -493,7 +533,7 @@ class Client(AsyncContextManager):
     async def wait_locked(self):
         await self._locked.wait()
 
-    async def retry_when_locked[T](self, action: Callable[[], Awaitable[T]]) -> T:
+    async def retry_when_locked(self, action: Callable[[], Awaitable[T]]) -> T:
         """Wait until the database is unlocked, then try to perform the given action. If the action raises a
         ProtocolError with the error code KEEPASS_DATABASE_NOT_OPENED, the action is tried again.
 
@@ -510,7 +550,7 @@ class Client(AsyncContextManager):
                 raise
 
     @staticmethod
-    def _make_message_data(session_client_id: SessionClientID, /, *, nonce: Nonce = None, **data):
+    def _make_message_data(session_client_id: SessionClientID, /, *, nonce: Optional[Nonce] = None, **data):
         """Adds nonce and clientID to the message data"""
         nonce_: Nonce = nonce or Nonce.generate()
         msg = dict(
@@ -614,8 +654,8 @@ class Client(AsyncContextManager):
             self,
             url: str,  # TODO: should this be restricted to valid URLs (?)
             identities: Iterable[DatabaseIdentity],
-            submit_url: str = None,
-            http_auth: bool = None,
+            submit_url: Optional[str] = None,
+            http_auth: Optional[bool] = None,
     ):
         optional_data = {}
         if submit_url is not None:

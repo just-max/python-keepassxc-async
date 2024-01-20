@@ -4,7 +4,7 @@ import logging
 
 
 from keepassxc.database import Client, DatabaseIdentity, generate_identification_key, Group
-from keepassxc.database import EstablishConnectionError, ProtocolError, ErrorCode
+from keepassxc.database import ProtocolError, ErrorCode
 
 
 try:
@@ -20,14 +20,14 @@ except ImportError:
         print(Group.dump_tree(g))
 
 
-async def connect_to_keepassxc(min_delay=1., max_delay=60.):
+async def connect_to_keepassxc(initial_delay=1., max_delay=60.):
     """Tries to connect to KeePassXC until a connection is established"""
 
-    delay = min_delay
+    delay = min(initial_delay, max_delay)
     while True:
         try:
             return await Client.create()
-        except EstablishConnectionError:
+        except* OSError as e:
             print(f"could not connect to KeePassXC, trying again in {delay} seconds...")
             await asyncio.sleep(delay)
             delay = min(delay * 2, max_delay)
